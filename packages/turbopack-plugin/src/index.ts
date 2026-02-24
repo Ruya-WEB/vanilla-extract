@@ -37,6 +37,13 @@ export type TurboLoaderOptions = {
 
 let sharedCompiler: VeCompiler | null = null;
 
+// Mutable ref so Vite plugins always use the latest loader context.
+// Updated before every compiler call — avoids the stale-closure problem
+// where the singleton compiler would permanently capture the first call's context.
+const loaderContextRef: { current: TurboLoaderContext<TurboLoaderOptions> | null } = {
+  current: null,
+};
+
 /**
  * reset the global state, used in tests to cleanup the compiler
  */
@@ -56,6 +63,9 @@ const getOrMakeCompiler = async ({
   nextEnv: Record<string, string | undefined> | null;
   loaderContext: TurboLoaderContext<TurboLoaderOptions>;
 }): Promise<VeCompiler> => {
+  // Always update the ref so plugins use the current loader context
+  loaderContextRef.current = loaderContext;
+
   if (sharedCompiler) return sharedCompiler;
 
   const defineEnv: Record<string, string> = {};
@@ -78,14 +88,14 @@ const getOrMakeCompiler = async ({
       plugins: [
         createNextFontVePlugin(),
         {
-          // route vite file reads through turbopack's fs to handle dependency tracking automatically
+          // Route vite file reads through turbopack's fs for dependency tracking.
+          // Reads from loaderContextRef.current so it always uses the active loader context.
           name: 'vanilla-extract-turbo-fs',
           enforce: 'pre',
           async load(id: string) {
+            const ctx = loaderContextRef.current!;
             return new Promise((resolve, reject) => {
-              // we can reuse this fs instance across all loader calls
-              // turbopack will associate dependencies to the file currently being loaded
-              loaderContext.fs.readFile(id, (error, data) => {
+              ctx.fs.readFile(id, (error, data) => {
                 if (error) {
                   reject(error);
                 } else if (typeof data === 'string') {
@@ -112,8 +122,9 @@ const getOrMakeCompiler = async ({
               source.endsWith('.ico') ||
               source.endsWith('.bmp')
             ) {
+              const ctx = loaderContextRef.current!;
               const sourceImage = path.isAbsolute(source)
-                ? path.join(loaderContext.rootContext, source)
+                ? path.join(ctx.rootContext, source)
                 : path.join(path.dirname(importer), source);
 
               // since we'll be using the image in our final css file, we must craft an import path that will resolve to the image file from the css file
@@ -128,7 +139,7 @@ const getOrMakeCompiler = async ({
 
               // determine the dimensions of the image
               const imageAsBuffer = new Promise<Buffer>((resolve, reject) => {
-                loaderContext.fs.readFile(sourceImage, (error, data) => {
+                ctx.fs.readFile(sourceImage, (error, data) => {
                   if (error) reject(error);
                   resolve(data);
                 });
@@ -138,7 +149,7 @@ const getOrMakeCompiler = async ({
               );
               const imageSize: { width?: number; height?: number } =
                 // @ts-expect-error - next.js version mismatch loads next 12 types but uses next 16 code
-                await getImageSize(await imageAsBuffer).catch((error) => {
+                await getImageSize(await imageAsBuffer).catch((error: unknown) => {
                   const message = `Process image "${sourceImage}" failed: ${error}`;
                   throw new Error(message);
                 });
@@ -174,7 +185,8 @@ const getOrMakeCompiler = async ({
               return null;
             }
 
-            const resolver = loaderContext.getResolve({});
+            const ctx = loaderContextRef.current!;
+            const resolver = ctx.getResolve({});
             return resolver(path.dirname(importer), source);
           },
         },
@@ -206,9 +218,10 @@ export default async function turbopackVanillaExtractLoader(
     loaderContext: this,
   });
 
-  // if turbopack invokes the loader quickly, vite can't invalidate the module fast enough
-  // so we disable the internal file watcher and manually invalidate the module instead
-  await compiler.invalidateAllModules();
+  // Invalidate only this file and its dependents rather than the entire module graph.
+  // The file watcher is disabled (enableFileWatcher: false) because turbopack invokes
+  // the loader faster than vite can react, so we do targeted invalidation here instead.
+  await compiler.invalidateModule(this.resourcePath);
 
   const { source, watchFiles } = await compiler.processVanillaFile(
     this.resourcePath,

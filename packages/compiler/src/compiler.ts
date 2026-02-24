@@ -239,7 +239,16 @@ export interface Compiler {
       outputCss?: boolean;
     },
   ): Promise<{ source: string; watchFiles: Set<string> }>;
+  /**
+   * Invalidates all non-node_modules modules in the Vite server and runner cache.
+   * Use sparingly — prefer `invalidateModule` for targeted invalidation.
+   */
   invalidateAllModules(): Promise<void>;
+  /**
+   * Invalidates a specific module and its dependents in the Vite module graph.
+   * Much cheaper than `invalidateAllModules` — use this when you know which file changed.
+   */
+  invalidateModule(filePath: string): Promise<void>;
   getCssForFile(virtualCssFilePath: string): { filePath: string; css: string };
   close(): Promise<void>;
   getAllCss(): string;
@@ -521,6 +530,29 @@ export const createCompiler = ({
       for (const [id, moduleNode] of server.moduleGraph.idToModuleMap) {
         if (!id.includes('node_modules')) {
           server.moduleGraph.invalidateModule(moduleNode);
+        }
+      }
+    },
+    async invalidateModule(filePath: string) {
+      const { server, runner } = await vitePromise;
+
+      filePath = isAbsolute(filePath) ? filePath : join(root, filePath);
+      const moduleId = normalizePath(filePath);
+
+      // Invalidate in the runner cache — this file and everything that depends on it
+      runner.moduleCache.invalidateDepTree([moduleId]);
+
+      // Invalidate in the Vite module graph — the file and its importers (dependents)
+      const moduleNode = server.moduleGraph.getModuleById(moduleId);
+      if (moduleNode) {
+        server.moduleGraph.invalidateModule(moduleNode);
+
+        // Also invalidate direct importers so they re-evaluate with fresh CSS
+        for (const importer of moduleNode.importers) {
+          server.moduleGraph.invalidateModule(importer);
+          if (importer.id) {
+            runner.moduleCache.invalidateDepTree([importer.id]);
+          }
         }
       }
     },
